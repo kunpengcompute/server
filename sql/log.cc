@@ -10743,8 +10743,13 @@ public:
   MEM_ROOT *ptr_mem_root;
   HASH     *ptr_xids;
   LOG_INFO *ptr_log_info;
+  HASH     replay_hash;
   Recovery_context(LOG_INFO *linfo, MEM_ROOT *mem_root, HASH *xids);
-  ~Recovery_context() { delete gtid_maybe_to_truncate; }
+  ~Recovery_context()
+  {
+    delete gtid_maybe_to_truncate;
+    my_hash_reset(&replay_hash);
+  }
   /*
     Completes the recovery procedure.
     In the normal case prepared xids gets committed when they also found
@@ -10967,7 +10972,7 @@ bool Recovery_context::roll_forward(MYSQL_BIN_LOG *binlog)
   static LEX_CSTRING connection_name= { STRING_WITH_LEN("Recovery") };
   rli->mi= new Master_info(&connection_name, false);
   if (!(rgi= thd->rgi_fake))
-    rgi= thd->rgi_fake= new rpl_group_info(rli);
+    rgi= thd->rgi_fake= new rpl_group_info(rli, ha_offset);
   rgi->thd= thd;
   thd->system_thread_info.rpl_sql_info=
     new rpl_sql_thread_info(rli->mi->rpl_filter);
@@ -10995,10 +11000,14 @@ bool Recovery_context::roll_forward(MYSQL_BIN_LOG *binlog)
       sql_print_error("%s", errmsg);
       goto err1;
     }
+    // TODO/Sujatha:
+    // 1. optimize to see the replay binlog to the replay offset after FD is found/processed
+    //    Events in the range [FD->log_pos, replay_offset] are irrelevant
+    // 2. Turn checksum verification ON regardless of the option (temp-ly/"Once" - see show_binlog_events()
     while (total_to_replay > 0 &&
-        (ev= Log_event::read_log_event(&log,
-                                       rli->relay_log.description_event_for_exec,
-                                       opt_master_verify_checksum)))
+           (ev= Log_event::read_log_event(&log,
+                                          rli->relay_log.description_event_for_exec,
+                                          opt_master_verify_checksum)))
     {
       if (!ev->is_valid())
       {
@@ -11015,53 +11024,16 @@ bool Recovery_context::roll_forward(MYSQL_BIN_LOG *binlog)
         enable_apply_event= true;
 
       if (typ == GTID_EVENT)
-      // {
-      //   Gtid_log_event *gev= (Gtid_log_event *)ev;
-      //   if (gev->flags2 &
-      //       (Gtid_log_event::FL_PREPARED_XA | Gtid_log_event::FL_COMPLETED_XA))
-      //   {
-      //     if ((member=
-      //          (xid_recovery_member*) my_hash_search(ptr_xids,
-      //                                                gev->xid.key(),
-      //                                                gev->xid.key_length())))
-      //     {
-      //       /*
-      //         When XA PREPARE group of events (as flagged so) check
-      //         its actual binlog state which may be COMPLETED. If the
-      //         state is also PREPARED then analyze through
-      //         in_engine_prepare whether the transaction needs replay.
-      //        */
-      //       if (gev->flags2 & Gtid_log_event::FL_PREPARED_XA)
-      //       {
-      //         //if (member->state == XA_PREPARE)
-      //         {
-      //           // XA prepared is not present in (some) engine then apply it
-      //           if (member->in_engine_prepare == 0)
-      //             enable_apply_event= true;
-      //           else if (//gev->flags2 & Gtid_log_event::FL_MULTI_ENGINE_XA &&
-      //                    xa_recover_htons > member->in_engine_prepare)
-      //           {
-      //             enable_apply_event= true;
-      //             // partially engine-prepared XA is first cleaned out prior replay
-      //             thd->lex->sql_command= SQLCOM_XA_ROLLBACK;
-      //             ha_commit_or_rollback_by_xid(&gev->xid, 0);
-      //           }
-      //           else
-      //             --recover_xa_count;
-      //         }
-      //       }
-      //       else if (gev->flags2 & Gtid_log_event::FL_COMPLETED_XA)
-      //       {
-      //         if (//member->state == XA_COMPLETE &&
-      //             member->in_engine_prepare > 0)
-      //           enable_apply_event= true;
-      //         else
-      //           --recover_xa_count;
-      //       }
-      //     }
-      //   }
-      // }
-
+      {
+        // look it up in the replay hash
+        rpl_gtid gtid= (gev->domain_id, gev->server_id, gev->seq_no);
+        if (my_hash_search(&replay_hash, (uchar*) &gtid))
+        {
+          enable_apply_event= true;
+        }
+      }
+      // TODO: check for other events to ignore irrelevant ones
+      // and call the below:
       if (enable_apply_event)
       {
         if ((err= ev->apply_event(rgi)))
@@ -11077,12 +11049,6 @@ bool Recovery_context::roll_forward(MYSQL_BIN_LOG *binlog)
         }
         else if (typ == FORMAT_DESCRIPTION_EVENT)
           enable_apply_event=false;
-        // else if (thd->lex->sql_command == SQLCOM_XA_PREPARE ||
-        //          thd->lex->sql_command == SQLCOM_XA_COMMIT  ||
-        //          thd->lex->sql_command == SQLCOM_XA_ROLLBACK)
-        // {
-        //   --recover_xa_count;
-        //   enable_apply_event=false;
 
         //   sql_print_information("Binlog event %s at %s:%llu"
         //       " successfully applied",
@@ -11164,6 +11130,10 @@ Recovery_context::Recovery_context(LOG_INFO *linfo_arg, MEM_ROOT *mem_root_arg,
   */
   ha_last_committed_binlog_pos(ptr_log_info, ha_offset,
                                &ha_offset_min, &ha_offset_max);
+  my_hash_init(key_memory_binlog_recover_exec, &replay_hash,
+               &my_charset_bin, 64,
+               offsetof(xid_recovery_member, gtid), sizeof(rpl_gtid),
+               NULL, NULL, 0);
 }
 
 bool Recovery_context::reset_truncate_coord(my_off_t pos)
@@ -11263,6 +11233,9 @@ bool Recovery_context::handle_committed(xid_recovery_member *member,
 
     if (total_to_replay == 0 || last_gtid_coord < replay_coordinate)
       replay_coordinate= last_gtid_coord;
+    member->gtid= last_gtid;
+    if (my_hash_insert(&replay_hash, (uchar*) member))
+      return true;
   }
   return false;
 }
