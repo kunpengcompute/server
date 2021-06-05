@@ -614,20 +614,6 @@ static struct
   void add(uint32_t space, const std::string &f_name, lsn_t lsn)
   {
     mysql_mutex_assert_owner(&recv_sys.mutex);
-    /* If an earlier tablespace file did exist by the same name, let
-    us remove it. Tablespace IDs are allocated from an ascending
-    sequence, so any earlier file should be associated with a smaller
-    tablespace ID. */
-    for (auto d= defers.begin(); d != defers.end(); )
-      if (d->second.file_name != f_name)
-        ++d;
-      else if (d->first < space)
-        defers.erase(d++);
-      else if (d->first == space)
-        break;
-      else
-        return; /* A later tablespace already has this name. */
-
     const char *filename= f_name.c_str();
 
     if (srv_operation == SRV_OPERATION_RESTORE)
@@ -654,14 +640,39 @@ static struct
 
     char *fil_path= fil_make_filepath(nullptr, {filename, strlen(filename)},
                                       IBD, false);
-    const item defer= {lsn, fil_path, false};
-    auto p= defers.emplace(space, defer);
-    if (!p.second && p.first->second.lsn <= defer.lsn)
-    {
-      defer.deleted= p.first->second.deleted;
-      p.first->second= defer;
-    }
+    const item defer{lsn, fil_path, false};
     ut_free(fil_path);
+
+    /* The file name must be unique. Keep the one with the latest LSN. */
+    auto d= defers.begin();
+
+    while (d != defers.end())
+    {
+      if (d->second.file_name != defer.file_name)
+        ++d;
+      else if (d->first == space)
+      {
+        /* Neither the file name nor the tablespace ID changed.
+        Update the LSN if needed. */
+        if (d->second.lsn < lsn)
+          d->second.lsn= lsn;
+        return;
+      }
+      else if (d->second.lsn < lsn)
+        defers.erase(d++);
+      else
+      {
+        ut_ad(d->second.lsn != lsn);
+        return; /* A later tablespace already has this name. */
+      }
+    }
+
+    auto p= defers.emplace(space, defer);
+    if (!p.second && p.first->second.lsn < lsn)
+    {
+      p.first->second.lsn= lsn;
+      p.first->second.file_name= defer.file_name;
+    }
   }
 
   void remove(uint32_t space)
