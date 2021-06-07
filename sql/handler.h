@@ -962,6 +962,7 @@ struct xid_recovery_member
   rpl_gtid gtid;          // also the key for re-exection hash
   char *binlog_file_name; // file name corr to binlog_coord and
   my_off_t xid_log_pos;   // Xid_log_event::log_pos
+  bool row_format_only;
 };
 
 /* for recover() handlerton call */

@@ -10968,6 +10968,7 @@ bool Recovery_context::roll_forward(MYSQL_BIN_LOG *binlog)
   File        file;
   bool enable_apply_event= false;
   Log_event *ev = 0;
+  bool seek_to_replay_coord= true;
 //#ifndef DBUG_OFF
   log_info_fname_record *binlog_fname_record=
     ptr_log_info->binlog_id_to_fname->at(replay_coordinate.first - 1);
@@ -11012,9 +11013,6 @@ bool Recovery_context::roll_forward(MYSQL_BIN_LOG *binlog)
       sql_print_error("%s", errmsg);
       goto err1;
     }
-    // TODO/Sujatha:
-    // optimize to see the replay binlog to the replay offset after FD is found/processed
-    //    Events in the range [FD->log_pos, replay_offset] are irrelevant
     while (total_to_replay > 0 &&
            (ev= Log_event::read_log_event(&log,
                                           rli->relay_log.description_event_for_exec,
@@ -11035,7 +11033,14 @@ bool Recovery_context::roll_forward(MYSQL_BIN_LOG *binlog)
       ev->thd= thd;
 
       if (typ == FORMAT_DESCRIPTION_EVENT)
+      {
         enable_apply_event= true;
+        if (seek_to_replay_coord)
+        {
+          my_b_seek(&log, replay_coordinate.second);
+          seek_to_replay_coord= false;
+        }
+      }
 
       if (typ == GTID_EVENT)
       {
@@ -11046,7 +11051,7 @@ bool Recovery_context::roll_forward(MYSQL_BIN_LOG *binlog)
         if ((member= (xid_recovery_member *)
              my_hash_search(&replay_hash, (uchar*) &gtid, sizeof(gtid))))
         {
-          if (member->to_replay > 0 && 1 /* TODO: member->is_safe_to_replay */)
+          if (member->to_replay > 0 && member->row_format_only)
           {
             rli->recovery_binlog_offset= member->binlog_coord;
             enable_apply_event= true;
@@ -11647,6 +11652,8 @@ int TC_LOG_BINLOG::recover(LOG_INFO *linfo, const char *last_log_name,
                                  static_cast<Xid_log_event*>(ev)))
           goto err2;
 #endif
+        if (member)
+          member->row_format_only= true;
       }
       break;
       case BINLOG_CHECKPOINT_EVENT:

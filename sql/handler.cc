@@ -2370,6 +2370,7 @@ xid_member_insert(HASH *hash_arg, my_xid xid_arg, MEM_ROOT *ptr_mem_root,
   member->to_replay= 0;
   member->binlog_coord= Binlog_offset(0,0);
   member->gtid= { 0,0,0 };
+  member->row_format_only= false;
   return my_hash_insert(hash_arg, (uchar*) member) ? NULL : member;
 }
 
@@ -2681,12 +2682,12 @@ int ha_recover(HASH *commit_list, MEM_ROOT *arg_mem_root)
     DBUG_RETURN(1);
   }
 
-  plugin_foreach(NULL, xarecover_handlerton, 
+  plugin_foreach(NULL, xarecover_handlerton,
                  MYSQL_STORAGE_ENGINE_PLUGIN, &info);
 
   my_free(info.list);
   if (info.found_foreign_xids)
-    sql_print_warning("Found %d prepared XA transactions", 
+    sql_print_warning("Found %d prepared XA transactions",
                       info.found_foreign_xids);
   if (info.dry_run && info.found_my_xids)
   {
